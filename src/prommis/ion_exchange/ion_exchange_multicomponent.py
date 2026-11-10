@@ -509,6 +509,21 @@ class IonExchangeMultiCompData(IonExchangeBaseData):
             units=pyo.units.dimensionless,
             doc="Bed volumes of feed at 50 percent breakthrough",
         )
+        self.bv = pyo.Var(
+            self.reactive_ion_set,
+            initialize=2e5,
+            bounds=(0, None),
+            units=pyo.units.dimensionless,
+            doc="Bed volumes of feed",
+        )
+        self.bv_trapezoids = pyo.Var(
+            self.reactive_ion_set,
+            self.trap_disc,
+            initialize=2e5,
+            bounds=(0, None),
+            units=pyo.units.dimensionless,
+            doc="Bed volumes of feed",
+        )
 
         @self.Expression(self.reactive_ion_set, doc="Breakthrough concentration")
         def breakthrough_conc_mass_comp(b, j):
@@ -516,7 +531,7 @@ class IonExchangeMultiCompData(IonExchangeBaseData):
                 b.conc_comp_norm_breakthrough[j] * prop_in.conc_mass_phase_comp[p0, j]
             )
 
-        # Add Expressions to calculate dimensionless numbers
+        # Calculate dimensionless numbers
         @self.Expression(self.reactive_ion_set, doc="Schmidt number")
         def N_Sc(b, j):  # Eq. 3.359, ref[1] Inglezakis + Poulopoulos
             return prop_in.visc_k_phase[p0] / prop_in.diffus_phase_comp[p0, j]
@@ -547,25 +562,22 @@ class IonExchangeMultiCompData(IonExchangeBaseData):
 
         # [ESR updates: Add multicomponent set for breakthrough_time
         # and bv]
-        @self.Expression(self.reactive_ion_set, doc="Bed volumes at breakthrough")
-        def bv(b, r):
-            return b.breakthrough_time[r] * b.loading_rate / b.bed_depth
+        @self.Constraint(self.reactive_ion_set, doc="Bed volumes at breakthrough")
+        def rule_bv(b, r):
+            return b.bv[r] * b.bed_depth == b.breakthrough_time[r] * b.loading_rate
 
         @self.Constraint(
             self.reactive_ion_set, doc="Clark equation with fundamental constants"
         )  # ref[2], Croll et al (2023), Eq.9
         def eq_clark(b, j):
-            left_side = pyo.exp(
-                (
-                    (b.mass_transfer_coeff[j] * b.bed_depth * (b.freundlich_n[j] - 1))
-                    / (b.bv_50[j] * b.loading_rate)
-                )
-                * (b.bv_50[j] - b.bv[j])
-            )
+            left_side = (
+                (b.mass_transfer_coeff[j] * b.bed_depth * (b.freundlich_n[j] - 1))
+                / (b.bv_50[j] * b.loading_rate)
+            ) * (b.bv_50[j] - b.bv[j])
             right_side = (
                 (1 / b.conc_comp_norm_breakthrough[j]) ** (b.freundlich_n[j] - 1) - 1
             ) / (2 ** (b.freundlich_n[j] - 1) - 1)
-            return left_side - right_side == 0
+            return (left_side) == pyo.log(right_side)
 
         # [ESR notes: This is the concentration value at the kth
         # “trapezoid” boundary for ion j.]
@@ -593,12 +605,14 @@ class IonExchangeMultiCompData(IonExchangeBaseData):
                     )
                 )
 
-        # [ESR updates: Add bv_trapezoids as an expression. This term
+        # [ESR updates: Add bv_trapezoids as a variable. This term
         # corresponds to the bed volume corresponding to the kth
         # discretization point for ion j.]
-        @self.Expression(self.reactive_ion_set, self.trap_disc, doc="BV for trapezoids")
-        def bv_trapezoids(b, j, k):
-            return (b.breakthrough_time_trapezoids[j, k] * b.loading_rate) / b.bed_depth
+        @self.Constraint(self.reactive_ion_set, self.trap_disc, doc="BV for trapezoids")
+        def rule_bv_trapezoids(b, j, k):
+            return b.bv_trapezoids[j, k] * b.bed_depth == (
+                (b.breakthrough_time_trapezoids[j, k] * b.loading_rate)
+            )
 
         @self.Constraint(
             self.reactive_ion_set,
@@ -609,22 +623,15 @@ class IonExchangeMultiCompData(IonExchangeBaseData):
             if k == max(self.trap_index):
                 return b.breakthrough_time_trapezoids[j, k] == b.breakthrough_time[j]
             else:
-                left_side = pyo.exp(
-                    (
-                        (
-                            b.mass_transfer_coeff[j]
-                            * b.bed_depth
-                            * (b.freundlich_n[j] - 1)
-                        )
-                        / (b.bv_50[j] * b.loading_rate)
-                    )
-                    * (b.bv_50[j] - b.bv_trapezoids[j, k])
-                )
+                left_side = (
+                    (b.mass_transfer_coeff[j] * b.bed_depth * (b.freundlich_n[j] - 1))
+                    / (b.bv_50[j] * b.loading_rate)
+                ) * (b.bv_50[j] - b.bv_trapezoids[j, k])
                 right_side = (
                     (1 / b.conc_comp_norm_trapezoids[j, k]) ** (b.freundlich_n[j] - 1)
                     - 1
                 ) / (2 ** (b.freundlich_n[j] - 1) - 1)
-                return left_side - right_side == 0
+                return (left_side) == pyo.log(right_side)
 
         # [ESR WIP: Try to make changes in the normalization term in
         # eq_trapezoids to see if that improves the breakthrough time
