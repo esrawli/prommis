@@ -36,7 +36,7 @@ from prommis.ion_exchange.ix_parameter_estimation import (
 def parmest_obj():
 
     regenerant = "single_use"
-    num_traps = 30
+    num_traps = 15
     c_trap_min = 1e-3
 
     data_name = "breakthrough_literature_data"
@@ -44,7 +44,7 @@ def parmest_obj():
     curve_file = os.path.join(path, "..", "data", f"{data_name}.csv")
 
     n_val = 1.00001
-    kt_val = 55
+    kt_val = 1e-1
     curve = 1
 
     # Call run_parmest_workflow exactly as called in
@@ -65,7 +65,7 @@ def parmest_obj():
 def test_full_parmest_run_and_data():
 
     regenerant = "single_use"
-    num_traps = 30
+    num_traps = 15
     c_trap_min = 1e-3
 
     data_name = "breakthrough_literature_data"
@@ -80,7 +80,7 @@ def test_full_parmest_run_and_data():
         "bv_50": {},
     }
 
-    kt_val = 55
+    kt_val = 1e-1
     n_val = 1.00001
     curve = [1]
 
@@ -119,13 +119,7 @@ def test_full_parmest_run_and_data():
         assert c0 is not None
 
         # Check parmest_theta structure.
-        parmest_variables = vars(c.parmest_theta)
-        assert "_mgr" in parmest_variables
-        mgr = parmest_variables["_mgr"]
-        items = mgr.items
-        values = mgr.blocks[0].values
-        assert len(items) == len(values)
-        parmest_values = dict(zip(items, values))
+        parmest_values = c.parmest_theta
 
         # Check that expected keys are in parmest_values.
         for key in [
@@ -141,10 +135,10 @@ def test_main(parmest_obj):
     # Test main() function.
     parmest_data = main(
         regenerant="single_use",
-        num_traps=30,
+        num_traps=15,
         c_trap_min=1e-3,
         data_name="breakthrough_literature_data",
-        kt_val=55,
+        kt_val=1e-1,
         n_val=1.00001,
         curve_list=[1],
     )
@@ -203,7 +197,7 @@ def test_ixparmest_methods(parmest_obj):
     # Test that parmest_obj is populated.
     assert hasattr(parmest_obj, "parmest_theta")
     assert hasattr(parmest_obj, "thetas")
-    theta_dict = parmest_obj.parmest_theta.to_dict()
+    theta_dict = parmest_obj.parmest_theta
     assert isinstance(theta_dict, dict)
 
 
@@ -228,7 +222,7 @@ def test_missing_initial_guess_raises():
         "regenerant": "single_use",
         "data_name": "breakthrough_literature_data",
         "curve": 1,
-        "num_traps": 30,
+        "num_traps": 15,
         "c_trap_min": 1e-3,
         "diff_calculation": "HaydukLaudie",
         "c0_min_thresh": 0,
@@ -240,10 +234,10 @@ def test_missing_initial_guess_raises():
 def test_diff_calculation_branches(parmest_obj):
     # Test HaydukLaudie branch
     parmest_obj.diff_calculation = "HaydukLaudie"
-    parmest_obj.get_curve_conditions(num_traps=1, c_trap_min=1e-3)
+    parmest_obj.get_curve_conditions(num_traps=15, c_trap_min=1e-3)
     assert "diffus_calculation" in parmest_obj.ion_props
 
     # Test non-HaydukLaudie branch
     parmest_obj.diff_calculation = "Other"
-    parmest_obj.get_curve_conditions(num_traps=1, c_trap_min=1e-3)
+    parmest_obj.get_curve_conditions(num_traps=15, c_trap_min=1e-3)
     assert "diffusivity_data" in parmest_obj.ion_props
