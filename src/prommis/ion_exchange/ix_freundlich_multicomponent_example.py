@@ -39,13 +39,19 @@ import matplotlib.pyplot as plt
 # Import Pyomo components
 import pyomo.environ as pyo
 
+from pyomo.util.infeasible import (
+    log_infeasible_constraints,
+    log_close_to_bounds,
+)
+
 # Import IDAES models and libraries
 from idaes.core import FlowsheetBlock, UnitModelCostingBlock
 from idaes.core.solvers import get_solver
 from idaes.core.scaling.scaling_base import ScalerBase
 from idaes.core.util.model_statistics import degrees_of_freedom
-from idaes.core.util.model_diagnostics import DiagnosticsToolbox
+from idaes.core.util.diagnostics_tools.diagnostics_toolbox import DiagnosticsToolbox
 from idaes.core.util.exceptions import ConfigurationError
+from idaes.core.util.scaling import constraint_scaling_transform
 
 # Import WaterTAP models and libraries
 from watertap.property_models.multicomp_aq_sol_prop_pack import MCASParameterBlock
@@ -111,7 +117,7 @@ def main():
     path = os.path.dirname(os.path.realpath(__file__))
     resin_file = os.path.join(path, "data", "resin_data.json")
     comp_prop_file = os.path.join(path, "data", "properties_data.json")
-    parmest_file = os.path.join(path, "data", "parmest_data.json")
+    parmest_file = os.path.join(path, "data", "parmest_data_calculated.json")
 
     # Read original breakthrough data for multiple components. The
     # data is from ref[1], Figure 4, using ref[2].
@@ -129,7 +135,7 @@ def main():
     num_traps = 30
     c_trap_min = 1e-3
     regenerant = "single_use"
-    save_plot = False
+    save_plot = True
     hazardous_waste = False
 
     # Build the model by calling the Pyomo ConcreteModel() component
@@ -169,6 +175,8 @@ def main():
     # Call IDAES diagnostics tool box to make sure there are no
     # structural issues in the model
     dt = DiagnosticsToolbox(model=m)
+    # dt.report_structural_issues()
+    # dt.display_overconstrained_set()
     dt.assert_no_structural_warnings()
 
     print()
@@ -177,12 +185,21 @@ def main():
 
     # Add scaling factors to the IX model variables and constraints
     set_scaling(m)
-    dt.assert_no_numerical_warnings(ignore_parallel_components=True)
+    # dt.assert_no_numerical_warnings(ignore_parallel_components=True)
+    dt.report_numerical_issues()
+    dt.display_constraints_with_large_residuals()
+    # dt.compute_infeasibility_explanation()
+    dt.display_near_parallel_constraints()
+    dt.display_near_parallel_variables()
 
     assert degrees_of_freedom(m) == 0
 
     # Solve scaled model with zero degrees of freedom
     init_results = model_solve(m)
+    # log_infeasible_constraints(m)
+    # log_close_to_bounds(m)
+    # quit()
+
     pyo.assert_optimal_termination(init_results)
     print("=========== End initialization")
 
@@ -194,7 +211,6 @@ def main():
 
     # Solve and re-initialize the model after adding costing variables
     initialize_system(m, solver=solver)
-
     dt.assert_no_structural_warnings()
 
     init_costing_results = model_solve(m, solver=solver)
@@ -245,12 +261,12 @@ def add_data(
     m.list_reactive_ions = ["La", "Dy", "Ho", "Er", "Yb", "Sm"]
     m.list_all = m.list_solvent + m.list_reactive_ions
 
-    # Declare lists and dictionaries to be used during scaling
-    m.fs.calc_from_constr_dict = {
-        "service_flow_rate": "eq_service_flow_rate",
-        "bed_volume_total": "eq_bed_design",
-        "column_height": "eq_column_height",
-    }
+    # # Declare lists and dictionaries to be used during scaling
+    # m.fs.calc_from_constr_dict = {
+    #     "service_flow_rate": "eq_service_flow_rate",
+    #     "bed_volume_total": "eq_bed_design",
+    #     "column_height": "eq_column_height",
+    # }
     m.fs.scale_from_value = [
         "bed_volume_total",
         "bed_diameter",
@@ -260,6 +276,9 @@ def add_data(
         "N_Re",
         "N_Pe_bed",
         "N_Pe_particle",
+        "loading_rate",
+        "bv",
+        "bv_50",
     ]
 
     # Read data for resins, properties of components, and calculated
@@ -381,6 +400,9 @@ def set_bounds(m):
 
     ix = m.fs.unit_ix
 
+    ix.N_Re.setlb(1e-6)
+    # ix.N_Pe_bed.setlb(1e-6)
+    # ix.N_Pe_particle.setlb(1e-6)
     ix.bed_porosity.setub(1)
     ix.number_columns.setlb(0)
     for c in m.fs.set_reactive_ions:
@@ -389,19 +411,25 @@ def set_bounds(m):
 
     ix.bed_diameter.setlb(0.01)
     ix.bed_diameter.setub(100)
-    ix.bed_depth.setlb(0.01)
+    ix.bed_depth.setlb(0.001)
     ix.bed_depth.setub(100)
     ix.service_flow_rate.setlb(1e-10)
     ix.process_flow.properties_in[0.0].visc_k_phase["Liq"].setlb(1e-16)
     ix.process_flow.properties_in[0].flow_vol_phase["Liq"].setlb(1e-16)
     for c in m.fs.set_reactive_ions:
         ix.process_flow.properties_in[0.0].diffus_phase_comp["Liq", c].setlb(1e-16)
-        ix.bv_50[c].setlb(1e-3)
+        ix.bv_50[c].setlb(0)
+        ix.bv_50[c].setub(1e3)
+        ix.bv[c].setlb(0)
         ix.loading_rate.setlb(1e-16)
-        ix.process_flow.properties_in[0].flow_mass_phase_comp["Liq", c].setlb(1e-16)
+        ix.process_flow.properties_in[0].flow_mass_phase_comp["Liq", c].setlb(1e-14)
         ix.process_flow.properties_out[0].flow_mass_phase_comp["Liq", c].setlb(1e-16)
+        ix.process_flow.properties_in[0].flow_mol_phase_comp["Liq", c].setlb(1e-14)
         for i in range(1, ix.number_of_trapezoids + 1):
-            ix.conc_comp_norm_trapezoids[c, i].setlb(1e-16)
+            ix.conc_comp_norm_trapezoids[c, i].setlb(1e-12)
+            ix.conc_comp_norm_trapezoids[c, i].setub(1 - 1e-10)
+            # ix.breakthrough_time_trapezoids[c, i].fix(1e-12)
+            # ix.bv_trapezoids[c, i].setlb(0)
 
 
 def set_operating_conditions(m, parmest_data=None, target_component=None, resin=None):
@@ -504,7 +532,7 @@ def set_operating_conditions(m, parmest_data=None, target_component=None, resin=
         ix.freundlich_n[c].fix(parmest_data["freundlich_n"][c])
         ix.mass_transfer_coeff[c].fix(parmest_data["mass_transfer_coeff"][c])
         ix.bv_50[c].fix(parmest_data["bv_50"][c])
-        ix.conc_comp_norm_breakthrough[c].fix(0.99)
+        ix.conc_comp_norm_breakthrough[c].fix(0.95)
 
     return m
 
@@ -531,7 +559,7 @@ def set_scaling(m):
 
     for var in m.fs.component_data_objects(pyo.Var, descend_into=True):
         if "temperature" in var.name:
-            sb.set_variable_scaling_factor(var, 1e-1, overwrite=True)
+            sb.set_variable_scaling_factor(var, 1e-2, overwrite=True)
         if "pressure" in var.name:
             sb.set_variable_scaling_factor(var, 1e-5)
         if "flow_vol" in var.name:
@@ -541,21 +569,28 @@ def set_scaling(m):
                 sb.set_variable_scaling_factor(var, 1e4)
             else:
                 sb.set_variable_scaling_factor(var, 1e8)
+        if "conc_comp_norm_breakthrough" in var.name:
+            if "H2O" in var.name:
+                sb.set_variable_scaling_factor(var, 1e-3)
+            else:
+                sb.set_variable_scaling_factor(var, 1e6)
+        if "breakthrough_time" in var.name:
+            sb.set_variable_scaling_factor(var, 1e-6)
 
-    for v in get_comp_list(ix):
-        ixv = getattr(ix, v)
-        if ixv.is_indexed():
-            idx = [*ixv.index_set()]
-            for i in idx:
-                if ixv[i].is_fixed():
-                    if ixv[i]() == 0:
-                        continue
-                    sb.set_variable_scaling_factor(ixv[i], 1 / ixv[i]())
-        else:
-            if ixv.is_fixed():
-                if ixv() == 0:
-                    continue
-                sb.set_variable_scaling_factor(ixv, 1 / ixv())
+    # for v in get_comp_list(ix):
+    #     ixv = getattr(ix, v)
+    #     if ixv.is_indexed():
+    #         idx = [*ixv.index_set()]
+    #         for i in idx:
+    #             if ixv[i].is_fixed():
+    #                 if ixv[i]() == 0:
+    #                     continue
+    #                 sb.set_variable_scaling_factor(ixv[i], 1 / ixv[i]())
+    #     else:
+    #         if ixv.is_fixed():
+    #             if ixv() == 0:
+    #                 continue
+    #             sb.set_variable_scaling_factor(ixv, 1 / ixv())
 
     for v in m.fs.scale_from_value:
         ixv = getattr(ix, v)
@@ -569,6 +604,9 @@ def set_scaling(m):
             if ixv() == 0:
                 continue
             sb.set_variable_scaling_factor(ixv, 1 / ixv())
+
+    # comp = ix.config.target_component
+    # constraint_scaling_transform(ix.eq_clark[comp], 1e-2)
 
     return m
 
@@ -773,7 +811,7 @@ def plot_traps(m, results=None, curve_data=None, output_plot=None, save_plot=Non
             x_orig_values,
             y_orig_values,
             marker=distinct_markers[idx % len(distinct_markers)],
-            ms=8,
+            ms=12,
             linestyle="",
             linewidth=0.5,
             color=distinct_colors[idx % len(distinct_colors)],
@@ -793,7 +831,7 @@ def plot_traps(m, results=None, curve_data=None, output_plot=None, save_plot=Non
             bvs_values,
             c_breakthru_values,
             linestyle="-",
-            linewidth=1,
+            linewidth=1.5,
             color=distinct_colors[idx % len(distinct_colors)],
             alpha=0.6,
             label=f"Calculated {c}",
@@ -817,12 +855,23 @@ def plot_traps(m, results=None, curve_data=None, output_plot=None, save_plot=Non
 
 def model_solve(m, solver=None):
 
-    opt_args = {
-        "print_user_options": "yes",
+    solver_options = {
+        "print_level": 5,
         "halt_on_ampl_error": "yes",
+        "nlp_scaling_method": "gradient-based",
+        "max_iter": 1000,
+        # "tol": 1e-6,
+        "bound_push": 1e-8,
+        # "constr_viol_tol": 1e-6,
+        # "acceptable_constr_viol_tol": 1e-6,
     }
 
-    solver = get_solver(solver="ipopt_v2", solver_options=opt_args)
+    # opt_args = {
+    #     "print_user_options": "yes",
+    #     "halt_on_ampl_error": "yes",
+    # }
+
+    solver = get_solver(solver="ipopt_v2", solver_options=solver_options)
     results = solver.solve(
         m,
         tee=True,
