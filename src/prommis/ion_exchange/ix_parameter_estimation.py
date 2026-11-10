@@ -83,19 +83,17 @@ from pyomo.environ import (
 import pyomo.contrib.parmest.parmest as parmest
 from pyomo.contrib.parmest.experiment import Experiment
 
+from idaes.core.scaling.scaling_base import ScalerBase
 import idaes.logger as idaeslog
 from idaes.core import FlowsheetBlock
 from idaes.core.util.model_statistics import degrees_of_freedom
-from idaes.core.util.scaling import (
-    calculate_scaling_factors,
-    set_scaling_factor,
-    constraint_scaling_transform,
-    unset_scaling_factor,
-)
+from idaes.core.util.scaling import constraint_scaling_transform
 
 from watertap.property_models.multicomp_aq_sol_prop_pack import MCASParameterBlock
 
 from prommis.ion_exchange.ion_exchange_multicomponent import IonExchangeMultiComp
+
+# import prommis.ion_exchange.utils_parameter_estimation as utils_pest
 
 log = idaeslog.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -116,12 +114,13 @@ path = os.path.dirname(os.path.realpath(__file__))
 
 def main(
     regenerant: str = "single_use",
-    num_traps: int = 30,
+    num_traps: int = 15,
     c_trap_min: float = 1e-3,
     data_name: str = "breakthrough_literature_data",
     kt_val: float = 55,
-    n_val: float = 1.00001,
+    # n_val: float = 1.00001,
     curve_list: list | None = None,
+    dir_name="parmest_results",
 ):
     results_parmest = []
     curve_file = f"data/{data_name}.csv"
@@ -130,7 +129,7 @@ def main(
         "c0_ref": {},
         "loading_rate": {},
         "mass_transfer_coeff": {},
-        "freundlich_n": {},
+        # "freundlich_n": {},
         "bv_50": {},
     }
 
@@ -142,29 +141,70 @@ def main(
             regenerant=regenerant,
             num_traps=num_traps,
             c_trap_min=c_trap_min,
-            n_val=n_val,
+            # n_val=n_val,
             kt_val=kt_val,
+            dir_name=dir_name,
         )
 
-        variables = vars(c)
-        compound = None
-        loading_rate = None
-        c0 = None
-        for key, val in variables.items():
-            if key == "component_data":
-                compound = val["name"]
-            elif key == "loading_rate":
-                loading_rate = val
-            elif key == "c0":
-                c0 = val
+        # Get the ix block
+        ix = c.m.fs.ix  # or getattr(c.m, 'fs').ix if needed
 
-        parmest_variables = vars(c.parmest_theta)
-        mgr = parmest_variables["_mgr"]
-        items = mgr.items
-        values = mgr.blocks[0].values
-        parmest_values = dict(zip(items, values))
+        # Access freundlich_n
+        freundlich_n = ix.freundlich_n[c.target_component].value
+
+        # Other variables
+        compound = c.component_data["name"]
+        # loading_rate = c.loading_rate
+        loading_rate = ix.loading_rate.value
+        c0 = c.c0
+        parmest_values = c.parmest_theta
+
+        save_parmest_data(
+            parmest_data,
+            c,
+            c0,
+            loading_rate,
+            freundlich_n,
+            parmest_values,
+        )
+        print(
+            f"-> Saving parameter estimation results for all components to "
+            f"{dir_name}/parmest_data_updated.json"
+        )
 
     return parmest_data
+
+
+def save_parmest_data(parmest_data, c, c0, loading_rate, freundlich_n, parmest_values):
+    """This function saves the calculated parameter estimation results
+    for all components to a parmest_data_calculated JSON file.
+
+    """
+
+    comp = c.target_component
+
+    # Initialize the compound entry
+    for var in [
+        "c0_ref",
+        "loading_rate",
+        "freundlich_n",
+        "mass_transfer_coeff",
+        "bv_50",
+    ]:
+        parmest_data.setdefault(var, {})[comp] = None
+
+    # Populate the dictionary
+    parmest_data["c0_ref"][comp] = float(c0)
+    parmest_data["loading_rate"][comp] = loading_rate
+    parmest_data["freundlich_n"][comp] = freundlich_n
+    parmest_data["mass_transfer_coeff"][comp] = parmest_values[
+        f"fs.ix.mass_transfer_coeff[{comp}]"
+    ]
+    parmest_data["bv_50"][comp] = parmest_values[f"fs.ix.bv_50[{comp}]"]
+
+    # Save the parmest_data to a JSON file
+    with open(f"data/parmest_data_calculated.json", "w") as json_file:
+        json.dump(parmest_data, json_file, indent=4)
 
 
 class IXParmest:
@@ -172,7 +212,6 @@ class IXParmest:
         self,
         theta_initial_guess: dict | None = None,
         fix_vars: dict | None = None,
-        cb50_min_thresh=None,
         **kwargs,
     ):
 
@@ -229,11 +268,10 @@ class IXParmest:
         if len(self.fix_initial_guess) == 0 and len(self.theta_initial_guess) == 0:
             raise ValueError("need to provide initial guess")
 
-        # By default, the minimum threshold for estimating BV50
-        # (cb50_min_thresh) is set equal to the minimum threshold for
-        # c0 (c0_min_thresh).
-        self.c0_min_thresh = kwargs.get("c0_min_thresh")
-        self.cb50_min_thresh = self.c0_min_thresh
+        # Parameters related to plots and files
+        self.dir_name = kwargs.get("dir_name")
+        self.figsize = kwargs.get("figsize")
+        self.all_figs = dict()
 
         self.scale_from_value = kwargs.get("scale_from_value")
 
@@ -294,11 +332,6 @@ class IXParmest:
 
         # Get original breakthrough data.
         self.get_bvs_cbs_breakthrough()
-
-        # Define scaling factor for objective function
-        if ((max(self.keep_bvs) - min(self.keep_bvs)) ** 2) > 0:
-            self.expr_sf = 1 / ((max(self.keep_bvs) - min(self.keep_bvs)) ** 2)
-            print("INFO: Using parmest scaling factor:", pyo.value(self.expr_sf))
 
         # Calculate initial values.
         self.c0_mol_flow = pyunits.convert(
@@ -382,9 +415,12 @@ class IXParmest:
         pf_in = m.fs.ix.process_flow.properties_in[0.0]
         pf_out = m.fs.ix.process_flow.properties_out[0.0]
 
-        pf_in.diffus_phase_comp["Liq", self.target_component].setlb(1e-16)
+        pf_in.flow_vol_phase["Liq"].setlb(1e-20)
+        pf_in.visc_k_phase.setlb(1e-20)
+        pf_in.diffus_phase_comp["Liq", self.target_component].setlb(1e-22)
         pf_in.flow_mass_phase_comp["Liq", self.target_component].setlb(1e-22)
-        pf_out.flow_mass_phase_comp["Liq", self.target_component].setlb(1e-16)
+        pf_out.flow_mass_phase_comp["Liq", self.target_component].setlb(1e-22)
+        pf_in.flow_mol_phase_comp["Liq", self.target_component].setlb(1e-22)
 
         for k, v in self.set_bounds.items():
             ixv = getattr(ix, k)
@@ -439,6 +475,9 @@ class IXParmest:
         ix.ebct.set_value(ebct_s)  # in s
         ix.conc_comp_norm_breakthrough[self.target_component].fix(0.80)
 
+        ix.freundlich_n[self.target_component].fix(1.0001)
+        ix.bv[self.target_component].set_value(250)
+
         # Fix initial guess for theta parameters.
         if isinstance(self.fix_initial_guess, dict):
             for k, v in self.fix_initial_guess.items():
@@ -450,35 +489,29 @@ class IXParmest:
 
         ix = self._get_ix_blk(m=m)
 
-        m.fs.properties.set_default_scaling(
-            "flow_mol_phase_comp",
-            1e5,
-            index=("Liq", "H2O"),
-        )
-        m.fs.properties.set_default_scaling(
-            "flow_mol_phase_comp",
-            self.c0_mol_flow_sf,
-            index=("Liq", self.target_component),
-        )
-        m.fs.properties.set_default_scaling(
-            "flow_mol_phase_comp",
-            self.water_mol_flow_sf,
-            index=("Liq", "H2O"),
-        )
+        comp = ix.config.target_component
 
-        for c in ix.component_objects(pyo.Var):
-            unset_scaling_factor(c)
+        sb = ScalerBase()
 
-        target_component = ix.config.target_component
-        prop_out = ix.process_flow.properties_out[0]
-        set_scaling_factor(
-            prop_out.flow_mol_phase_comp["Liq", target_component], self.c0_mol_flow_sf
-        )
-        set_scaling_factor(
-            prop_out.flow_mol_phase_comp["Liq", "H2O"], self.water_mol_flow_sf
-        )
-
-        calculate_scaling_factors(m)
+        for var in m.fs.component_data_objects(pyo.Var, descend_into=True):
+            if "temperature" in var.name:
+                sb.set_variable_scaling_factor(var, 1e-1, overwrite=True)
+            if "pressure" in var.name:
+                sb.set_variable_scaling_factor(var, 1e-5)
+            if "flow_vol" in var.name:
+                sb.set_variable_scaling_factor(var, 1e8)
+            if "flow_mol_phase_comp" in var.name:
+                if "H2O" in var.name:
+                    sb.set_variable_scaling_factor(var, self.water_mol_flow_sf)
+                else:
+                    sb.set_variable_scaling_factor(var, self.c0_mol_flow_sf)
+            if "conc_comp_norm_breakthrough" in var.name:
+                if "H2O" in var.name:
+                    sb.set_variable_scaling_factor(var, 1e-3)
+                else:
+                    sb.set_variable_scaling_factor(var, 1e6)
+            if "breakthrough_time" in var.name:
+                sb.set_variable_scaling_factor(var, 1e-6)
 
         if isinstance(self.scale_from_value, list):
             for v in self.scale_from_value:
@@ -488,13 +521,13 @@ class IXParmest:
                     for i in idx:
                         if ixv[i]() == 0:
                             continue
-                        set_scaling_factor(ixv[i], 1 / ixv[i]())
+                        sb.set_variable_scaling_factor(ixv[i], 1 / ixv[i]())
                 else:
                     if ixv() == 0:
                         continue
-                    set_scaling_factor(ixv, 1 / ixv())
+                    sb.set_variable_scaling_factor(ixv, 1 / ixv())
 
-        constraint_scaling_transform(ix.eq_clark[target_component], 1e-1)
+        constraint_scaling_transform(ix.eq_clark[comp], 1e-1)
 
     def deactivate_trapezoids(self, m):
         """This method deactivates all equations related to the
@@ -520,6 +553,13 @@ class IXParmest:
         ix.eq_mass_transfer_reactive_ions.deactivate()
         pf.mass_transfer_term[0, "Liq", self.target_component].fix()
 
+    def _calc_from_constr(self, m):
+
+        ix = m.fs.ix
+
+        if not hasattr(self, "calc_from_constr_fail"):
+            self.calc_from_constr_fail = dict()
+
     def _get_ix_blk(self, m=None):
 
         for blk in m.fs.component_objects(pyo.Block):
@@ -530,6 +570,7 @@ class IXParmest:
 
         m.fs.ix.initialize(outlvl=idaeslog.INFO)
 
+    # def run_all_things(self, plot_things, save_things, overwrite=True):
     def run_all_things(self, overwrite=True):
         """Run all methods for parmest."""
 
@@ -546,6 +587,10 @@ class IXParmest:
         }
 
         self.run_parmest(solver_options)
+
+        # utils_pest.plot_estimated_curve(self, solver_options)
+        # os.makedirs(self.dir_name, exist_ok=True)
+        # utils_pest.save_figs(self)
 
     def get_bvs_cbs_breakthrough(self):
         """This method saves extracted breakthrough data."""
@@ -610,22 +655,14 @@ class IXParmest:
         self.df_exp = pd.DataFrame.from_dict(exp_dict).set_index("exp_num")
         self.df_exp["c0"] = self.c0
         for i in self.df_exp.index:
-            self.experiment_list.append(IXExperiment(self, self.df_exp, i))
+            exper = IXExperiment(self, self.df_exp, i)
+            self.experiment_list.append(exper)
+            # print('in exp list:', exper.data_i)
 
     def run_parmest(self, solver_options):
         """Run parmest"""
 
         print(f"\nINFO: Running parmest...")
-
-        def SSE(model):
-            """Calculates the scaled sum of squared error between
-            `experiment_output` model and data values.
-
-            """
-            expr = sum(
-                (y - y_hat) ** 2 for y, y_hat in model.experiment_outputs.items()
-            )
-            return expr * self.expr_sf
 
         if not hasattr(self, "experiment_list"):
             self.build_parmest_experiment_list()
@@ -633,17 +670,16 @@ class IXParmest:
         # Create an instance of the Parmest Estimator and solve.
         self.pestimator = parmest.Estimator(
             self.experiment_list,
-            # obj_function="SSE",
-            obj_function=SSE,
-            diagnostic_mode=True,
+            obj_function="SSE",
+            diagnostic_mode=False,
             tee=True,
             solver_options=solver_options,
         )
 
         n = len(self.experiment_list)
-        self.obj, self.parmest_theta = self.pestimator.theta_est(
-            calc_cov=False, cov_n=n
-        )
+        self.obj, self.parmest_theta = self.pestimator.theta_est()
+
+        self.cov = self.pestimator.cov_est()
 
         # Print the values of the fitted parameters.
         print()
@@ -655,15 +691,24 @@ class IXParmest:
         print()
         print("==============================")
 
+        # # # Create a new directory to save the results and also access
+        # # the estimated parameters from regression results and save
+        # # them in a new dictionary theta_dict. The estimated
+        # # parameters in this dictionary are used to calculate the
+        # # estimated curve in plot_estimated_curve.
+        # utils_pest.create_results_directory(self)
+        # utils_pest.extract_and_save_theta(self)
+
 
 class IXExperiment(Experiment):
-    def __init__(self, ix_parmest_obj, data, experiment_number):
+    def __init__(self, ix_parmest_obj, data, experiment_number, meas_error=None):
         self.data = data
         self.experiment_number = experiment_number
         self.data_i = data.loc[experiment_number]
         self.ix_parmest_obj = ix_parmest_obj
         self.model = None
         self.thetas = self.ix_parmest_obj.thetas
+        self.meas_error = meas_error
 
     def create_model(self):
         self.model = self.ix_parmest_obj.build_parmest()
@@ -673,15 +718,14 @@ class IXExperiment(Experiment):
         m = self.model
         cb = float(self.data_i.cb)
         c0 = float(self.data_i.c0)
-        bv = float(self.data_i.bv)
+
+        # Add target_component index
         self.conc_comp_norm_breakthrough = cb / c0
         m.fs.ix.conc_comp_norm_breakthrough.fix(self.conc_comp_norm_breakthrough)
 
         for k in self.ix_parmest_obj.initial_guess_dict.keys():
             ixv = getattr(self.model.fs.ix, k)
             ixv.unfix()
-
-        assert m is self.model
 
         return m
 
@@ -690,27 +734,49 @@ class IXExperiment(Experiment):
         m = self.model
 
         m.experiment_outputs = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+        m.measurement_error = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+
+        # Get the target component
+        target_component = m.fs.ix.config.target_component
 
         m.experiment_outputs.update(
             [
                 (
-                    m.fs.ix.conc_comp_norm_breakthrough[
-                        m.fs.ix.config.target_component
-                    ],
+                    m.fs.ix.conc_comp_norm_breakthrough[target_component],
                     self.data_i["conc_comp_norm_breakthrough"],
                 ),
-                (m.fs.ix.bv[m.fs.ix.config.target_component], self.data_i["bv"]),
+                (m.fs.ix.bv[target_component], self.data_i["bv"]),
             ]
         )
-        m.unknown_parameters = pyo.Suffix(direction=pyo.Suffix.LOCAL)
+
+        m.measurement_error.update(
+            [
+                (
+                    m.fs.ix.conc_comp_norm_breakthrough[target_component],
+                    self.meas_error,
+                ),
+                (m.fs.ix.bv[target_component], self.meas_error),
+            ]
+        )
 
         m.unknown_parameters.update(
             [
-                (k, ComponentUID(k))
-                for k in [getattr(m.fs.ix, theta) for theta in self.thetas]
+                # (
+                #     m.fs.ix.freundlich_n[target_component],
+                #     ComponentUID(m.fs.ix.freundlich_n[target_component])
+                # ),
+                (
+                    m.fs.ix.mass_transfer_coeff[target_component],
+                    ComponentUID(m.fs.ix.mass_transfer_coeff[target_component]),
+                ),
+                (
+                    m.fs.ix.bv_50[target_component],
+                    ComponentUID(m.fs.ix.bv_50[target_component]),
+                ),
             ]
         )
-        assert m is self.model
+
         return m
 
     def get_labeled_model(self):
@@ -729,20 +795,22 @@ def run_parmest_workflow(
     regenerant,
     num_traps,
     c_trap_min,
-    n_val,
+    # n_val,
     kt_val,
+    dir_name,
 ):
 
     df_ree = pd.read_csv(curve_file)
     set_bounds = {
-        "mass_transfer_coeff": [0, 1e3],
-        "freundlich_n": [1, 1e3],
-        "bv_50": [1e-3, 1e3],
+        "mass_transfer_coeff": [1e-3, 1e2],
+        # "freundlich_n": [1, 1e3],
+        "bv_50": [0, 1e3],
+        "bv": [1e-3, 1e3],
         "service_flow_rate": [0, 1e6],
-        "loading_rate": [0, 1e6],
         "ebct": [0, 1e6],
         "bed_diameter": [0.01, 100],
-        "bed_depth": [0.01, 100],
+        "bed_depth": [0.001, 100],
+        "loading_rate": [0, 1e6],
     }
     scale_from_value = [
         "bed_volume_total",
@@ -750,11 +818,29 @@ def run_parmest_workflow(
         "service_flow_rate",
         "ebct",
         "bv_50",
+        "resin_diam",
+        "resin_density",
+        "bed_porosity",
+        "bed_diameter",
+        "bed_volume",
+        "bed_volume_total",
+        "bed_depth",
+        "number_columns",
+        "number_columns_redundant",
+        "conc_comp_norm_breakthrough",
+        # "freundlich_n",
+        "mass_transfer_coeff",
+        "loading_rate",
+        "bv",
+        "N_Re",
+        "N_Pe_particle",
+        "N_Pe_bed",
+        "breakthrough_time",
     ]
 
     # IX parameters to estimate.
     thetas = [
-        "freundlich_n",
+        # "freundlich_n",
         "mass_transfer_coeff",
         "bv_50",
     ]
@@ -781,11 +867,11 @@ def run_parmest_workflow(
     # By default, bv_50 has no initial guess. Default initial guess
     # for bv_50 is avg of BV values from curve.
     initial_guess_dict = {
-        "freundlich_n": n_val,
+        # "freundlich_n": n_val,
         "mass_transfer_coeff": kt_val,
     }
     fix_initial_guess = {
-        "freundlich_n": n_val,
+        # "freundlich_n": n_val,
         "mass_transfer_coeff": kt_val,
     }
 
@@ -806,6 +892,8 @@ def run_parmest_workflow(
         diff_calculation="HaydukLaudie",
         c0_min_thresh=0,
         thetas=thetas,
+        figsize=(10, 8),
+        dir_name=dir_name,
     )
 
     c.run_all_things()
@@ -815,5 +903,5 @@ def run_parmest_workflow(
 
 if __name__ == "__main__":
 
-    curve_list = [1]
+    curve_list = [1, 2, 3, 4, 5, 6]
     main(curve_list=curve_list)
