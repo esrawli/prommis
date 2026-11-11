@@ -154,8 +154,8 @@ def main(
 
         # Other variables
         compound = c.component_data["name"]
-        # loading_rate = c.loading_rate
-        loading_rate = ix.loading_rate.value
+        loading_rate = c.loading_rate
+        # loading_rate = ix.loading_rate.value
         c0 = c.c0
         parmest_values = c.parmest_theta
 
@@ -169,7 +169,7 @@ def main(
         )
         print(
             f"-> Saving parameter estimation results for all components to "
-            f"{dir_name}/parmest_data_updated.json"
+            "data/parmest_data_calculated.json"
         )
 
     return parmest_data
@@ -219,7 +219,8 @@ class IXParmest:
         self.data_name = kwargs.get("data_name")
         self.curve = kwargs.get("curve")
         self.df_curve = self.load_curve_data(self.curve, self.data_name)
-        self.df_curve.sort_values("bv", inplace=True)
+        self.df_curve = self.df_curve.sort_values("bv")
+
         self.setup_parameters(**kwargs)
 
         self.m = self.build_model()
